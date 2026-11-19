@@ -7,6 +7,7 @@ coordenador compara a ordem observada por cada processo.
 ## Integrantes
 
 - Gabriel Freitas — 202003564
+- Wevton Santana - 202103785
 
 ## Arquitetura
 
