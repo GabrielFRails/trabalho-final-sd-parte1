@@ -43,6 +43,7 @@ implementados separadamente.
 | `peerCommunicatorUDP.py` | servidor `Peer` e troca de mensagens UDP |
 | `comparisonServer.py` | coordenador e servidor `ComparisonServer` |
 | `constMP.py` | configuração (endereços, portas e timeouts) |
+| `aws/run_peer.sh` | sobe um peer numa instância EC2 (descobre o IP público) |
 
 ## Requisitos
 
@@ -205,6 +206,33 @@ Cenários de falha, com `RPC_CALL_TIMEOUT=3` e `RPC_LOG_WAIT_TIMEOUT=3`:
 | mesmo peer reiniciado | registro sem duplicata; a rodada seguinte funciona |
 | peer congelado (`kill -STOP`) no meio da rodada | timeout dos logs; rodada abortada (o abort ao peer congelado expira com `DEADLINE_EXCEEDED`) |
 | rodada após o peer voltar (`kill -CONT`) | o peer descarta a rodada presa e a nova rodada funciona |
+
+### Execução na AWS (duas regiões)
+
+Configuração:
+
+- 7 peers: 5 em N. Virginia (`us-east-1`) e 2 em Oregon (`us-west-2`), um por
+  instância EC2 (Ubuntu 24.04), iniciados com `aws/run_peer.sh`;
+- Group Manager e Comparison Server numa instância separada em N. Virginia;
+- comunicação pelos IPs públicos, com TCP 5678-5680 e UDP 6789-6790 liberados
+  nos Security Groups das duas regiões.
+
+| Mensagens por peer | Mensagens recebidas por peer | Posições fora de ordem |
+|---:|---:|---:|
+| 5 | 35 de 35 | 33 de 35 (94%) |
+| 10 | 70 de 70 | 64 de 70 (91%) |
+| 30 | 210 de 210 | 208 de 210 (99%) |
+| 50 | 350 de 350 | 339 de 350 (97%) |
+
+Nenhuma mensagem foi perdida nessas rodadas, mas quase todas as posições
+diferem entre os peers. A latência entre regiões (cerca de 70 ms, contra menos
+de 1 ms dentro de uma região) faz cada peer observar uma intercalação diferente
+das mensagens. É o problema de escalabilidade geográfica que o MPComm
+demonstra.
+
+A métrica compara os logs posição por posição: uma única mensagem adiantada
+desloca todas as posições seguintes daquele peer. Por isso ela indica que as
+ordens divergem, e não quantas mensagens trocaram de lugar.
 
 O relatório da tentativa de executar o código original está em
 [`docs/resultado_execucao_experimento.md`](docs/resultado_execucao_experimento.md).
