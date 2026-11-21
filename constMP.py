@@ -26,4 +26,6 @@ GROUPMNGR_ADDR = os.getenv("GROUPMNGR_ADDR", "127.0.0.1")
 GROUPMNGR_RPC_PORT = _env_int("GROUPMNGR_RPC_PORT", 5680)
 
 RPC_LOG_WAIT_TIMEOUT = _env_int("RPC_LOG_WAIT_TIMEOUT", 60)
+# Deadline of each individual gRPC call, in seconds.
+RPC_CALL_TIMEOUT = float(os.getenv("RPC_CALL_TIMEOUT", "10"))
 

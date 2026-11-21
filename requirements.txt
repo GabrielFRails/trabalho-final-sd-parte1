@@ -1,0 +1,4 @@
+grpcio==1.85.3
+protobuf==7.36.2
+# Necessário apenas para regenerar os stubs (gen_proto.sh):
+grpcio-tools==1.85.3
