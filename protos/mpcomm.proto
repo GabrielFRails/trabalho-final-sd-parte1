@@ -32,10 +32,22 @@ message LogEntry {
   int32 number = 2;
 }
 
+// Contadores do multicast UDP confiável de um peer em uma rodada.
+message PeerStats {
+  int32 data_sent = 1;        // mensagens DATA enviadas pela primeira vez
+  int32 retransmissions = 2;  // reenvios por falta de ACK (todos os tipos)
+  int32 simulated_drops = 3;  // datagramas descartados por UDP_LOSS_RATE
+  int32 acks_sent = 4;
+  int32 acks_received = 5;
+  int32 duplicates = 6;       // pacotes recebidos de novo e descartados
+  int32 gave_up = 7;          // pacotes abandonados após UDP_MAX_RETRIES
+}
+
 message LogRequest {
   int32 peer_id = 1;
   int32 experiment_id = 2;
   repeated LogEntry entries = 3;
+  PeerStats stats = 4;
 }
 
 // Cadastro de peers. Clientes: peers e Comparison Server.
