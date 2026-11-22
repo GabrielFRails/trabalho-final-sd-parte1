@@ -8,6 +8,7 @@ coordenador compara a ordem observada por cada processo.
 
 - Gabriel Freitas — 202003564
 - Wevton Santana - 202103785
+- Gabriel Soares - 202301444
 
 ## Arquitetura
 
