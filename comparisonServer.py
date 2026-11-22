@@ -1,6 +1,7 @@
 """Experiment coordinator and gRPC log collector."""
 
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import grpc
@@ -32,12 +33,14 @@ class LogCollector(mpcomm_pb2_grpc.ComparisonServerServicer):
     def __init__(self):
         self._condition = threading.Condition()
         self._logs = {}
+        self._stats = {}
         self._experiment_id = None
 
     def begin(self, experiment_id):
         with self._condition:
             self._experiment_id = experiment_id
             self._logs = {}
+            self._stats = {}
 
     def SubmitLog(self, request, context):
         with self._condition:
@@ -49,9 +52,12 @@ class LogCollector(mpcomm_pb2_grpc.ComparisonServerServicer):
             self._logs[request.peer_id] = [
                 (entry.sender, entry.number) for entry in request.entries
             ]
+            self._stats[request.peer_id] = request.stats
+            # Imprime antes de acordar a thread principal, para as linhas
+            # não se misturarem com o relatório da comparação.
+            print(f"Received log from peer {request.peer_id} "
+                  f"({len(request.entries)} messages)")
             self._condition.notify_all()
-        print(f"Received log from peer {request.peer_id} "
-              f"({len(request.entries)} messages)")
         return mpcomm_pb2.Reply(message="log received")
 
     def wait_for_logs(self, expected_peers, timeout):
@@ -63,6 +69,10 @@ class LogCollector(mpcomm_pb2_grpc.ComparisonServerServicer):
                 missing = sorted(set(range(expected_peers)) - set(self._logs))
                 raise TimeoutError(f"Timed out waiting for peer logs: {missing}")
             return [self._logs[peer_id] for peer_id in range(expected_peers)]
+
+    def stats(self):
+        with self._condition:
+            return dict(self._stats)
 
 
 def prompt_user():
@@ -136,14 +146,46 @@ def stop_peers(peers):
             print("Could not stop:", error)
 
 
+def fifo_violations(log):
+    """Mensagens entregues depois de outra posterior do mesmo remetente."""
+    highest = {}
+    violations = 0
+    for sender, number in log:
+        if number < highest.get(sender, -1):
+            violations += 1
+        else:
+            highest[sender] = number
+    return violations
+
+
+def check_logs(logs, n_msgs):
+    """Confere cada log: completude, duplicatas e ordem FIFO."""
+    expected = {(sender, number)
+                for sender in range(len(logs)) for number in range(n_msgs)}
+    print(f"{'peer':>4} {'received':>8} {'missing':>7} {'duplicates':>10} "
+          f"{'FIFO violations':>15}")
+    totals = Counter()
+    for peer_id, log in enumerate(logs):
+        counts = Counter(log)
+        missing = len(expected - counts.keys())
+        duplicates = sum(count - 1 for count in counts.values())
+        violations = fifo_violations(log)
+        totals.update(missing=missing, duplicates=duplicates,
+                      violations=violations)
+        print(f"{peer_id:>4} {len(log):>8} {missing:>7} {duplicates:>10} "
+              f"{violations:>15}")
+    print(f"Expected {len(expected)} messages per peer. Totals: "
+          f"{totals['missing']} missing, {totals['duplicates']} duplicates, "
+          f"{totals['violations']} FIFO violations")
+
+
 def compare_logs(logs):
-    """Compare the observed global order while reporting missing messages."""
+    """Compara a ordem global: posições em que algum peer difere do peer 0."""
     if not logs:
         print("No logs received.")
         return
 
-    lengths = [len(log) for log in logs]
-    maximum_length = max(lengths)
+    maximum_length = max(len(log) for log in logs)
     unordered = 0
 
     for index in range(maximum_length):
@@ -151,8 +193,17 @@ def compare_logs(logs):
         if any(value != values[0] for value in values[1:]):
             unordered += 1
 
-    print("Messages received by each peer:", lengths)
-    print(f"Found {unordered} unordered message positions")
+    print(f"Found {unordered} unordered message positions (total order)")
+
+
+def print_udp_stats(stats_by_peer):
+    if not stats_by_peer:
+        return
+    fields = [field.name for field in mpcomm_pb2.PeerStats.DESCRIPTOR.fields]
+    totals = {field: sum(getattr(stats, field)
+                         for stats in stats_by_peer.values())
+              for field in fields}
+    print("UDP totals:", ", ".join(f"{k}={v}" for k, v in totals.items()))
 
 
 def stop_group_manager():
@@ -177,7 +228,9 @@ def run_experiment(collector, peers, n_msgs, experiment_id):
         print("Aborting the experiment on all peers.")
         abort_peers(peers)
         return
+    check_logs(logs, n_msgs)
     compare_logs(logs)
+    print_udp_stats(collector.stats())
 
 
 def coordinate(collector):
