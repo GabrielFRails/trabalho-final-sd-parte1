@@ -25,9 +25,9 @@ aplicação na primeira vez. Assim, a garantia "pelo menos uma vez" da
 retransmissão, somada ao descarte de duplicatas, resulta em cada mensagem
 entregue exatamente uma vez.
 
-Este módulo não ordena as mensagens: um DATA retransmitido pode ser entregue
-depois de DATAs posteriores do mesmo remetente. A ordenação FIFO fica na
-aplicação (``MessageHandler`` em peerCommunicatorUDP.py).
+Este módulo não ordena as mensagens: um DATA retransmitido chega depois de
+DATAs posteriores do mesmo remetente. A ordenação FIFO fica na camada acima,
+na fila de espera do ``MessageHandler`` (peerCommunicatorUDP.py).
 """
 
 import json

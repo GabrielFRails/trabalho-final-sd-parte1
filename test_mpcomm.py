@@ -14,7 +14,7 @@ from socket import AF_INET, SOCK_DGRAM, socket
 import reliableUDP
 from comparisonServer import fifo_violations
 from peerCommunicatorUDP import MessageHandler
-from reliableUDP import DATA, ReliableChannel
+from reliableUDP import DATA, STOP, ReliableChannel
 
 
 class Endpoint:
@@ -147,22 +147,56 @@ class FifoMetricTest(unittest.TestCase):
         self.assertEqual(fifo_violations([(0, 2), (0, 0), (0, 1)]), 2)
 
 
-class FifoDeliveryTest(unittest.TestCase):
-    """Meta da segunda metade da Parte 1b (ordenação FIFO)."""
+def new_handler(expected_peers=1):
+    return MessageHandler(None, None, peer_id=0, experiment_id=1,
+                          expected_peers=expected_peers,
+                          stop_receiving=threading.Event())
 
-    # Remover esta linha quando a FIFO for implementada em
-    # MessageHandler._on_data: o teste deve passar a ter sucesso.
-    @unittest.expectedFailure
+
+def feed(handler, packets):
+    """Entrega pacotes (tipo, remetente, número) ao handler, sem imprimir."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        for kind, src, seq in packets:
+            handler._handle({"t": kind, "src": src, "seq": seq})
+
+
+class FifoDeliveryTest(unittest.TestCase):
+    """Ordenação FIFO: a fila de espera do MessageHandler."""
+
     def test_out_of_order_arrivals_are_delivered_in_fifo_order(self):
-        handler = MessageHandler(None, None, peer_id=0, experiment_id=1,
-                                 expected_peers=1,
-                                 stop_receiving=threading.Event())
-        arrivals = [2, 0, 3, 1, 4]  # ordem de chegada das mensagens do peer 0
-        with contextlib.redirect_stdout(io.StringIO()):
-            for seq in arrivals:
-                handler._handle({"t": DATA, "src": 0, "seq": seq})
-            handler._handle({"t": reliableUDP.STOP, "src": 0, "seq": 5})
+        handler = new_handler()
+        feed(handler, [(DATA, 0, seq) for seq in [2, 0, 3, 1, 4]]
+             + [(STOP, 0, 5)])
         self.assertEqual(handler.log, [(0, n) for n in range(5)])
+        self.assertEqual(handler.held_count, 2)  # o 2 e o 3 esperaram
+        self.assertTrue(handler.delivery_complete.is_set())
+
+    def test_senders_are_independent(self):
+        # O 0 do remetente 0 está atrasado, mas isso não segura o remetente 1:
+        # FIFO só ordena mensagens de um mesmo remetente.
+        handler = new_handler(expected_peers=2)
+        feed(handler, [(DATA, 0, 1), (DATA, 1, 0), (DATA, 1, 1), (DATA, 0, 0)])
+        self.assertEqual(handler.log, [(1, 0), (1, 1), (0, 0), (0, 1)])
+
+    def test_round_ends_only_after_the_gap_is_filled(self):
+        handler = new_handler()
+        feed(handler, [(DATA, 0, 1), (DATA, 0, 2), (STOP, 0, 3)])
+        self.assertEqual(handler.log, [])  # tudo esperando pelo 0
+        self.assertFalse(handler.delivery_complete.is_set())
+        feed(handler, [(DATA, 0, 0)])  # chega a retransmissão
+        self.assertEqual(handler.log, [(0, 0), (0, 1), (0, 2)])
+        self.assertTrue(handler.delivery_complete.is_set())
+
+    def test_fifo_over_real_lossy_transfer(self):
+        # Ordem de chegada real produzida pelo canal com 30% de perda.
+        _, receiver = run_transfer(200, loss_rate=0.3)
+        arrivals = receiver.delivered
+        self.assertGreater(fifo_violations(arrivals), 0)  # chegou fora de ordem
+        handler = new_handler()
+        feed(handler, [(DATA, src, seq) for src, seq in arrivals]
+             + [(STOP, 0, 200)])
+        self.assertEqual(handler.log, [(0, n) for n in range(200)])
+        self.assertEqual(fifo_violations(handler.log), 0)
         self.assertTrue(handler.delivery_complete.is_set())
 
 

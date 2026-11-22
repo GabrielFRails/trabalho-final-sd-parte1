@@ -32,7 +32,8 @@ A comunicação de dados entre peers continua usando sockets UDP, conforme a
 especificação da Parte 1, agora com uma camada de confiabilidade própria (ACK,
 retransmissão e descarte de duplicatas), descrita em
 [Tratamento de perda de mensagens](#tratamento-de-perda-de-mensagens-parte-1b).
-A ordenação FIFO é a segunda metade da Parte 1b e ainda está pendente.
+As mensagens de cada remetente são entregues em ordem FIFO, por meio de uma
+fila de espera descrita em [Ordenação FIFO](#ordenação-fifo-parte-1b).
 
 ### Arquivos
 
@@ -279,7 +280,7 @@ pois ele executa código ao desserializar dados vindos da rede):
 - **Confiabilidade separada da ordenação.** `reliableUDP.py` garante que cada
   mensagem chegue exatamente uma vez, mas entrega na ordem de chegada. A
   ordenação fica na camada acima (`MessageHandler`), como no modelo de
-  *hold-back queue*. Assim a FIFO pode ser feita sem mexer no transporte, e as
+  *hold-back queue*. Assim a FIFO foi feita sem mexer no transporte, e as
   Partes 3 e 4 podem trocar a política de entrega pela ordem total.
 - **Simulação de perda no envio.** O descarte vale para todos os datagramas,
   inclusive ACKs e retransmissões. Perder um ACK é o caso que gera duplicatas,
@@ -309,33 +310,78 @@ faltaram, quantas vieram repetidas e quantas violaram a ordem FIFO (mensagem
 entregue depois de outra posterior do mesmo remetente). Em seguida vem a
 métrica original de ordem global e a soma dos contadores UDP dos peers:
 
+Exemplo com 3 peers, 50 mensagens cada e 20% de perda simulada:
+
 ```
 peer received missing duplicates FIFO violations
-   0      150       0          0              28
-   1      150       0          0              27
-   2      150       0          0              20
-Expected 150 messages per peer. Totals: 0 missing, 0 duplicates, 75 FIFO violations
-Found 144 unordered message positions (total order)
-UDP totals: data_sent=450, retransmissions=257, simulated_drops=257, acks_sent=586, acks_received=468, duplicates=118, gave_up=0
+   0      150       0          0               0
+   1      150       0          0               0
+   2      150       0          0               0
+Expected 150 messages per peer. Totals: 0 missing, 0 duplicates, 0 FIFO violations
+Found 130 unordered message positions (total order)
+UDP totals: data_sent=450, retransmissions=289, simulated_drops=289, acks_sent=606, acks_received=468, duplicates=138, gave_up=0
 ```
 
-Os contadores se conferem entre si. Cada pacote confiável recebe exatamente
-um ACK (`acks_received` = DATA + READY + STOP = 450 + 9 + 9), cada datagrama
-descartado gera uma retransmissão, e cada ACK perdido gera uma duplicata no
-receptor (`acks_sent` = 468 + `duplicates`).
+- `missing`, `duplicates` e `FIFO violations` devem ser sempre 0: é o que a
+  Parte 1b garante.
+- `unordered message positions` continua alto, e isso é esperado: FIFO não é
+  ordem total (veja [Ordenação FIFO](#ordenação-fifo-parte-1b)).
+- Os contadores se conferem entre si. Cada pacote confiável recebe exatamente
+  um ACK (`acks_received` = DATA + READY + STOP = 450 + 9 + 9), cada datagrama
+  descartado gera uma retransmissão, e cada ACK perdido gera uma duplicata no
+  receptor (`acks_sent` = 468 + `duplicates`).
+
+## Ordenação FIFO (Parte 1b)
+
+A retransmissão recupera a mensagem perdida, mas ela chega **depois** das
+seguintes. Se a mensagem 1 de um peer se perde, a ordem de chegada pode ser
+0, 2, 3, 1, 4. Entregar na ordem de chegada viola a ordem FIFO: mensagens de
+um mesmo remetente devem ser entregues na ordem em que ele as enviou.
+
+A solução é uma **fila de espera** (*hold-back queue*) por remetente, em
+`MessageHandler._on_data`:
+
+1. O receptor sabe qual é o próximo número esperado de cada remetente. Como
+   os números começam em 0, ele é a quantidade de mensagens já entregues dele.
+2. Se a mensagem que chegou é a esperada, ela é entregue. Senão, fica na fila.
+3. Depois de cada entrega, as mensagens seguintes que já estavam na fila são
+   liberadas em sequência.
+
+| Chega | Esperado | Ação | Na fila depois | Log |
+|---:|---:|---|---|---|
+| 0 | 0 | entrega 0 | – | 0 |
+| 2 | 1 | guarda | {2} | 0 |
+| 3 | 1 | guarda | {2, 3} | 0 |
+| 1 | 1 | entrega 1, libera 2 e 3 | – | 0, 1, 2, 3 |
+| 4 | 4 | entrega 4 | – | 0, 1, 2, 3, 4 |
+
+A camada de confiabilidade já descartou as duplicatas, então cada número
+chega à fila uma única vez. A rodada só termina quando o log tem todas as
+mensagens anunciadas no `STOP`, e isso só acontece depois que as lacunas são
+preenchidas.
+
+Na saída do peer, uma mensagem adiantada aparece como
+`Message 3 from process 2 held (waiting for 1)`. No fim da rodada, o peer
+informa quantas mensagens esperaram na fila:
+`FIFO: 57 messages arrived early and waited in the hold-back queue`.
+
+**FIFO não é ordem total.** A fila ordena as mensagens de cada remetente, mas
+não decide como intercalar remetentes diferentes. Dois peers podem entregar
+`(0,0), (1,0)` e `(1,0), (0,0)`, e os dois logs respeitam FIFO. Por isso a
+métrica de ordem global (`unordered message positions`) continua alta. Deixar
+todas as réplicas com a mesma ordem é o assunto da Parte 3.
 
 ## Limitações atuais
 
-- **Ordenação FIFO (segunda metade da Parte 1b):** ainda não implementada.
-  Uma mensagem retransmitida é entregue quando chega, depois de mensagens
-  posteriores do mesmo remetente. Isso aparece como `FIFO violations` na
-  saída. O ponto de implementação está marcado em `MessageHandler._on_data`,
-  em [`peerCommunicatorUDP.py`](peerCommunicatorUDP.py).
 - **Ordem total:** mesmo com FIFO, peers diferentes podem intercalar de forma
   diferente mensagens de remetentes diferentes. Isso é esperado (FIFO só
   ordena mensagens de um mesmo remetente) e é o assunto da Parte 3.
 - Um peer que deixa de responder por completo faz os outros desistirem de seus
   pacotes após `UDP_MAX_RETRIES` e a rodada é abortada pelo coordenador.
+- **Perda alta deixa a rodada mais lenta.** Como o prazo de retransmissão
+  dobra a cada tentativa, a rodada termina quando chega o pacote mais azarado.
+  Com 30% de perda, uma rodada de 30 mensagens leva de 3 a 6 segundos. Por
+  isso `RPC_LOG_WAIT_TIMEOUT` não deve ser muito baixo em testes com perda.
 
 ## Validação realizada
 
@@ -345,8 +391,8 @@ receptor (`acks_sent` = 468 + `duplicates`).
 python3 -m unittest -v
 ```
 
-Os 8 testes usam sockets UDP reais no loopback, sem gRPC nem outros
-processos, e levam cerca de 3 segundos:
+Os 11 testes usam sockets UDP reais no loopback, sem gRPC nem outros
+processos, e levam cerca de 5 segundos:
 
 | Teste | Verifica |
 |---|---|
@@ -356,7 +402,10 @@ processos, e levam cerca de 3 segundos:
 | `test_without_retransmission_messages_are_lost` | sem retransmissão, a mesma perda faz mensagens sumirem |
 | `test_duplicate_is_acked_but_not_delivered` | a duplicata recebe ACK de novo, mas não é entregue |
 | `FifoMetricTest` | a contagem de violações FIFO do Comparison Server |
-| `FifoDeliveryTest` | **meta da ordenação FIFO**, marcado como falha esperada até ela ser implementada |
+| `test_out_of_order_arrivals_are_delivered_in_fifo_order` | chegada 2, 0, 3, 1, 4 vira log 0, 1, 2, 3, 4 |
+| `test_senders_are_independent` | uma mensagem atrasada de um remetente não segura as de outro |
+| `test_round_ends_only_after_the_gap_is_filled` | com uma lacuna, a rodada não termina até a retransmissão chegar |
+| `test_fifo_over_real_lossy_transfer` | a ordem de chegada real de uma transferência com 30% de perda sai em ordem FIFO |
 
 A versão gRPC foi executada localmente com três peers:
 
@@ -376,19 +425,25 @@ Cenários de falha, com `RPC_CALL_TIMEOUT=3` e `RPC_LOG_WAIT_TIMEOUT=3`:
 | peer congelado (`kill -STOP`) no meio da rodada | timeout dos logs; rodada abortada (o abort ao peer congelado expira com `DEADLINE_EXCEEDED`) |
 | rodada após o peer voltar (`kill -CONT`) | o peer descarta a rodada presa e a nova rodada funciona |
 
-### Perda de mensagens (Parte 1b)
+### Perda de mensagens e ordenação FIFO (Parte 1b)
 
 Executado localmente com `run_local.sh`, Linux, Python 3.14:
 
-| Cenário | Peers × msgs | Recebidas por peer | Faltando | Duplicadas no log | Retransmissões | Violações FIFO |
-|---|---:|---:|---:|---:|---:|---:|
-| sem perda | 3 × 20 (2 rodadas) | 60 de 60 | 0 | 0 | 0 | 0 |
-| 5% de perda simulada | 3 × 50 | 150 de 150 | 0 | 0 | 45 | 19 |
-| 20% de perda simulada | 3 × 50 | 150 de 150 | 0 | 0 | 257 | 75 |
-| 40% de perda simulada | 3 × 50 | 150 de 150 | 0 | 0 | 740 | 136 |
-| 60% de perda simulada | 5 × 20 | 100 de 100 | 0 | 0 | 2792 | 225 |
-| 30% de perda, 4 rodadas seguidas | 3 × 20 | 60 de 60 em todas | 0 | 0 | 195 a 239 | 40 a 44 |
-| perda real (rajada, buffer de 4 KB) | 3 × 300 | 900 de 900 | 0 | 0 | 1551 | 868 |
+| Cenário | Peers × msgs | Recebidas por peer | Faltando | Duplicadas | Retransmissões | Retidas na fila | Violações FIFO |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| sem perda | 3 × 20 (2 rodadas) | 60 de 60 | 0 | 0 | 0 | 0 | 0 |
+| 5% de perda simulada | 3 × 50 | 150 de 150 | 0 | 0 | 40 | 27 | 0 |
+| 20% de perda simulada | 3 × 50 | 150 de 150 | 0 | 0 | 289 | 158 | 0 |
+| 40% de perda simulada | 3 × 50 | 150 de 150 | 0 | 0 | 755 | 354 | 0 |
+| 60% de perda simulada | 5 × 20 | 100 de 100 | 0 | 0 | 2843 | 375 | 0 |
+| 20% de perda, 6 peers | 6 × 30 | 180 de 180 | 0 | 0 | 639 | 359 | 0 |
+| 30% de perda, 5 rodadas seguidas | 3 × 20 | 60 de 60 em todas | 0 | 0 | 167 a 215 por rodada | 424 no total | 0 |
+| perda real (rajada, buffer de 4 KB) | 3 × 300 | 900 de 900 | 0 | 0 | 1890 | 2080 | 0 |
+
+Antes da fila de espera, os mesmos cenários tinham de 19 (5% de perda) a 868
+(perda real) violações FIFO: a mensagem perdida era recuperada, mas entregue
+depois das seguintes. Com a fila, todas são 0. Já a ordem global continua
+divergindo entre os peers, como esperado.
 
 Para comparação, sem retransmissão (`UDP_MAX_RETRIES=0`):
 
@@ -397,17 +452,17 @@ Para comparação, sem retransmissão (`UDP_MAX_RETRIES=0`):
 | 20% de perda simulada, 3 × 50 | handshakes perdidos; dois peers nem começaram a enviar; cerca de 40 de 150 mensagens entregues; rodada abortada por timeout |
 | perda real (rajada, buffer de 4 KB), 3 × 300 | 487 a 544 de 900 mensagens entregues; rodada abortada por timeout |
 
-Outros cenários verificados:
+Outros cenários verificados, com os cinco terminais e as portas deste README:
 
-- peer congelado (`kill -STOP`) no meio de uma rodada com 20% de perda: a
-  rodada é abortada; depois do `kill -CONT`, a rodada seguinte entrega 60 de 60
-  mensagens e o comando `0` encerra todos os processos;
-- com 60% de perda, 2 pacotes foram abandonados (`gave_up`), mas nenhuma
-  mensagem faltou: eram ACKs para um peer que já tinha recebido tudo e
+- só um peer com 30% de perda, 6 rodadas de 30 mensagens: 90 de 90 em todas,
+  0 violações FIFO, de 2,9 a 5,5 s por rodada. Os outros peers também
+  retransmitem, porque os ACKs desse peer se perdem;
+- peer congelado (`kill -STOP`) no meio de uma rodada: a rodada é abortada;
+  depois do `kill -CONT`, a rodada seguinte entrega 60 de 60 mensagens e o
+  comando `0` encerra todos os processos;
+- com 60% de perda, alguns pacotes podem ser abandonados (`gave_up`) sem
+  faltar mensagem: são ACKs para um peer que já tinha recebido tudo e
   encerrado.
-
-As violações FIFO confirmam o que a segunda metade da Parte 1b precisa
-resolver: a mensagem perdida é recuperada, mas chega depois das seguintes.
 
 ### Execução na AWS (duas regiões)
 

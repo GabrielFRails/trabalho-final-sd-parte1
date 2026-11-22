@@ -97,8 +97,9 @@ class MessageHandler(threading.Thread):
     """Recebe os pacotes UDP de uma rodada e monta o log de entregas.
 
     ACKs, retransmissões e duplicatas são resolvidos pelo ReliableChannel;
-    aqui só chegam pacotes novos. A thread continua rodando depois que tudo
-    foi entregue, para seguir respondendo ACKs, até ``stop_receiving``.
+    aqui só chegam pacotes novos, que são entregues em ordem FIFO. A thread
+    continua rodando depois que tudo foi entregue, para seguir respondendo
+    ACKs, até ``stop_receiving``.
     """
 
     def __init__(self, sock, channel, peer_id, experiment_id, expected_peers,
@@ -116,6 +117,8 @@ class MessageHandler(threading.Thread):
         self._handshakes = set()
         self._announced = {}  # remetente -> quantidade de DATA (do STOP)
         self._delivered = {}  # remetente -> quantidade de DATA entregues
+        self._held = {}       # remetente -> números esperando na fila (FIFO)
+        self.held_count = 0   # mensagens que chegaram adiantadas e esperaram
 
     def run(self):
         print("Handler is ready. Waiting for the handshakes...")
@@ -152,21 +155,29 @@ class MessageHandler(threading.Thread):
         self._check_complete()
 
     def _on_data(self, src, seq):
-        # ------------------------------------------------------------------
-        # PARTE 1b, SEGUNDA METADE: ORDENAÇÃO FIFO (a implementar)
-        #
-        # Aqui chega cada DATA exatamente uma vez (o canal já descartou as
-        # duplicatas), mas não necessariamente em ordem: se a mensagem 3 de
-        # um remetente se perder, a 4 chega antes e a 3 só vem na
-        # retransmissão. Hoje ela é entregue assim que chega, e o
-        # comparador acusa isso como "FIFO violations".
-        #
-        # Para FIFO: manter, por remetente, o próximo número esperado e uma
-        # fila de espera (hold-back queue). Entregar com _deliver somente
-        # quando seq for o esperado, e em seguida liberar da fila as
-        # mensagens consecutivas que já estavam esperando.
-        # ------------------------------------------------------------------
-        self._deliver(src, seq)
+        """Ordenação FIFO com fila de espera (hold-back queue).
+
+        Cada DATA chega aqui exatamente uma vez, mas não necessariamente em
+        ordem: se a mensagem 3 de um remetente se perde, a 4 chega antes e a
+        3 só vem na retransmissão. A mensagem só é entregue quando todas as
+        anteriores do mesmo remetente já foram; quem chega adiantado espera
+        na fila. Ao entregar a esperada, liberam-se as seguintes que já
+        estavam na fila.
+
+        Como os números começam em 0, o próximo número esperado de um
+        remetente é a quantidade de mensagens já entregues dele.
+        """
+        held = self._held.setdefault(src, set())
+        held.add(seq)
+        expected = self._delivered.get(src, 0)
+        if seq != expected:
+            self.held_count += 1
+            print(f"Message {seq} from process {src} held "
+                  f"(waiting for {expected})")
+        while expected in held:
+            held.remove(expected)
+            self._deliver(src, expected)
+            expected += 1
 
     def _deliver(self, src, seq):
         """Entrega a mensagem à aplicação, isto é, registra no log."""
@@ -326,6 +337,8 @@ class PeerExperiment:
         with open(f"logfile{self.peer_id}.log", "w", encoding="utf-8") as log_file:
             log_file.write(str(log))
         print("UDP stats:", ", ".join(f"{k}={v}" for k, v in asdict(stats).items()))
+        print(f"FIFO: {self.handler.held_count} messages arrived early and "
+              "waited in the hold-back queue")
         if stats.gave_up:
             print(f"WARNING: gave up on {stats.gave_up} packets after "
                   f"{UDP_MAX_RETRIES} retransmissions")
